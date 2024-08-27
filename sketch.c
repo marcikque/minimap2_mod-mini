@@ -59,7 +59,7 @@ static inline int tq_shift(tiny_queue_t *q)
 }
 
 
-void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int is_hpc, mm128_v *p, int i);
+void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int is_hpc, mm128_v *p, int i, int ID);
 
 /**
  * Find symmetric (w,k)-minimizers on a DNA sequence
@@ -143,7 +143,11 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				info.x = hash64(tmer[z], mask) << 8 | tmer_span; 
 				// tmer.x[63:8] = tmer[z] hashed, trimmed
 				// tmer.x[7:0]  = tmer_span
+				//int temp = t > i? 0 : i-t+1;
 				info.y = (uint64_t)(i - tmer_span + 1) << 8; 
+				//assert(tmer_span < len);
+
+				//fprintf(stderr, "Checking Creation: i = %d, len = %d\n", tmer_span, len);
 				// tmer.y[63:9] = global starting position
 				// tmer.y[7:0] = buffer position
 			}
@@ -176,7 +180,7 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 					// get the global starting index for kmer calculation
 					int glbl_relative = buf[buf_relative].y >> 8;
 
-					mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
+					mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 1);
 				}
 			}
 			for (int j = 0; j < buf_pos; ++j, ++w_relative) {
@@ -185,7 +189,7 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 					int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
 					int glbl_relative = buf[buf_relative].y >> 8;
 
-					mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
+					mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 2);
 				}
 			}	
 			
@@ -216,7 +220,7 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
 				int glbl_relative = buf[buf_relative].y >> 8;
 
-				mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
+				mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 3);
 			}
 			// clear and set the lowest 8bits to save buf_pos (useful for later)
 			info.y = info.y & ~0xFF;
@@ -230,7 +234,11 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 			if (l >= w + k - 1 && min.x != UINT64_MAX) {
 				// old min had to be at index 0 of previous window
 				int glbl_relative = min.y >> 8;
-				mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
+				if (len < glbl_relative) {
+					fprintf(stderr, "Checking assertion: i = %d, len = %d\n", glbl_relative, len);
+
+				}
+				mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 4);
 			}
 
 			min.x = UINT64_MAX;
@@ -257,7 +265,7 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 						int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
 						int glbl_relative = buf[buf_relative].y >> 8;
 
-						mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
+						mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 5);
 					}
 				}
 				for (int j = 0; j <= buf_pos; ++j, ++w_relative) {
@@ -266,7 +274,7 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 						int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
 						int glbl_relative = buf[buf_relative].y >> 8;
 
-						mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
+						mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 6);
 					}
 				}
 			}
@@ -287,7 +295,7 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 		int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
 		int glbl_relative = buf[buf_relative].y >> 8;
 
-		mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
+		mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 7);
 	}
 }
 
@@ -304,7 +312,22 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
  * @param p      minimizers
  * @param i		 index of kmer to push
  */
-void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int is_hpc, mm128_v *p, int i) {
+void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int is_hpc, mm128_v *p, int i, int ID) {
+	
+	
+	
+	if (len <= i) {
+		fprintf(stderr, "Checking assertion: i = %d, len = %d\n", i, len);
+		assert(ID != 1);
+		assert(ID != 2);
+		assert(ID != 3);
+		assert(ID != 4);
+		assert(ID != 5);
+		assert(ID != 6);
+		assert(ID != 7);
+	}
+	
+	assert(i >= 0);
 	assert(len > i);
 
 	uint64_t shift1 = 2 * (k - 1);
@@ -321,7 +344,7 @@ void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int 
 			return;
 		}
 
-		if (is_hpc) { // TODO: dissect HPC functionality
+		if (is_hpc) { // TODO: dissect HPC functionality and potentially upgrade
 			int skip_len = 1;
 			if (j + 1 < len && seq_nt4_table[(uint8_t)str[j + 1]] == c) { 
 
