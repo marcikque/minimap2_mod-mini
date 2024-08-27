@@ -58,6 +58,7 @@ static inline int tq_shift(tiny_queue_t *q)
 	return x;
 }
 
+
 void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int is_hpc, mm128_v *p, int i);
 
 /**
@@ -79,7 +80,7 @@ void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int 
  */
 void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, int is_hpc, mm128_v *p)
 {
-	assert(!is_hpc); // TODO: blocked for index translation testing
+	
 	
 	// "The mod-minimizer: a simple and efficientsampling algorithm for long k-mers"
 	int r = (int) ceil(log2(w+k-1) / 2) + 1; // r=4 default | TODO: Threshold experiment
@@ -142,8 +143,9 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				info.x = hash64(tmer[z], mask) << 8 | tmer_span; 
 				// tmer.x[63:8] = tmer[z] hashed, trimmed
 				// tmer.x[7:0]  = tmer_span
-				info.y = (uint64_t)(i - tmer_span + 1); 
-				// tmer.y[63:0] = starting position
+				info.y = (uint64_t)(i - tmer_span + 1) << 8; 
+				// tmer.y[63:9] = global starting position
+				// tmer.y[7:0] = buffer position
 			}
 		} else {
 			l = 0;
@@ -155,50 +157,87 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 		buf[buf_pos] = info;
 
 		/*
-		- windows go from 0 to w-1, contain w kmers, the last of which starts at w-1 and ends at w+k-2
+		- windows go from 0 to w-1, contain w kmers, the last of which starts at w-1 and ends at w-1+k-1
 		- windows contain w+k-t tmers, the last of which starts at w+k-t-1 and ends at w+k-2
 		- this code is constantly operating on a window's last tmer
+		- buf_pos is our relative position within the ring buffer, it has no say about our relative position within the window
+			(which is always at the very end of the very last tmer: position w-1+k-1)
 		*/
 
 		// special case: 1st window identical kmers
 		if (l == w + k - 1 && min.x != UINT64_MAX) {
-			for (int j = buf_pos + 1; j < w + k - t; ++j) {
+			int w_relative = 0;
+			for (int j = buf_pos + 1; j < w + k - t; ++j, ++w_relative) {
 				if (min.x == buf[j].x && buf[j].y != min.y) {
-					int min_index = i - (w + k - t) + (j % w);
-					mm_push_index(km, str, len, k, rid, 0, p, min_index);
+					// mod-minimizer
+					int min_index = w_relative % w;
+					// get the buffer position that represents the new mod-minimizer position
+					int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
+					// get the global starting index for kmer calculation
+					int glbl_relative = buf[buf_relative].y >> 8;
+
+					mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
 				}
 			}
-			/*
-			special case part 2, removed experimentially since l==w+k-1 ==> buf_pos==0
-			(might only execute after c>=4 reset with partially filled buffer as buf_pos isn't reset)
-			for (int j = 0; j < buf_pos; ++j) {
+			for (int j = 0; j < buf_pos; ++j, ++w_relative) {
 				if (min.x == buf[j].x && buf[j].y != min.y) {
-					kv_push(mm128_t, km, *p, buf[j]);
+					int min_index = w_relative % w;
+					int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
+					int glbl_relative = buf[buf_relative].y >> 8;
+
+					mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
 				}
 			}	
-			*/
+			
 		}
 
-		// case: new minimum found
+
+		// TODO: multi-tmer support (min becomes a list of tuples (min, buf_pos) or list of singles with lowest 8bit of y buf_pos)
+		// TODO: split cases:
+			// 1. info.x < min.x
+			// 2. info.x == min.x
+			// 3. info.x > min.x
+		// TODO: implement shifting
+
+		// case: new minimum found, push the old one
 		if (info.x <= min.x) {
 			if (l >= w + k && min.x != UINT64_MAX) {
-				int min_index = i - (w + k - t) + ((w + k - t - i) % w);
-				mm_push_index(km, str, len, k, rid, 0, p, min_index);
+				// the old min was the min of the previous window
+				// operate relative to previous window
+				int dist_to_front;
+				if (buf_pos >= min_pos) {
+					dist_to_front = buf_pos - min_pos;
+				} else {
+					dist_to_front = (w + k - t - 1) - min_pos + buf_pos;
+				}
+				int w_relative = w + k - 2 - dist_to_front;
+				// -1 as it's the old window
+				int min_index = (w_relative - 1) % w;
+				int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
+				int glbl_relative = buf[buf_relative].y >> 8;
+
+				mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
 			}
+			// clear and set the lowest 8bits to save buf_pos (useful for later)
+			info.y = info.y & ~0xFF;
+			info.y = info.y | (buf_pos & 0xFF);
 			min = info;
 			min_pos = buf_pos;
+			
 
 		//case: old minimum moved out of the window (buffer)
 		} else if (buf_pos == min_pos) { 
 			if (l >= w + k - 1 && min.x != UINT64_MAX) {
-				int min_index = i - (w + k - t - 2);
-				mm_push_index(km, str, len, k, rid, 0, p, min_index);
+				// old min had to be at index 0 of previous window
+				int glbl_relative = min.y >> 8;
+				mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
 			}
 
 			min.x = UINT64_MAX;
-			// relative position = w+k-t-(steps back)
 			for (int j = buf_pos + 1; j <  w + k - t; ++j) {
 				if (min.x >= buf[j].x) {
+					buf[j].y = buf[j].y & ~0xFF;
+					buf[j].y = buf[j].y | (j & 0xFF);
 					min = buf[j];
 					min_pos = j;
 				}
@@ -214,14 +253,20 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				int w_relative = 0;
 				for (int j = buf_pos + 1; j < w + k - t; ++j, ++w_relative) {
 					if (min.x == buf[j].x && min.y != buf[j].y) {
-						int min_index = i - (w + k - t) + (w_relative % w);
-						mm_push_index(km, str, len, k, rid, 0, p, min_index);
+						int min_index = w_relative % w;
+						int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
+						int glbl_relative = buf[buf_relative].y >> 8;
+
+						mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
 					}
 				}
 				for (int j = 0; j <= buf_pos; ++j, ++w_relative) {
 					if (min.x == buf[j].x && min.y != buf[j].y) {
-						int min_index = i - (w + k - t) + (w_relative % w);
-						mm_push_index(km, str, len, k, rid, 0, p, min_index);
+						int min_index = w_relative % w;
+						int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
+						int glbl_relative = buf[buf_relative].y >> 8;
+
+						mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
 					}
 				}
 			}
@@ -231,8 +276,18 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 		}
 	}
 	if (min.x != UINT64_MAX) {
-		int min_index = (len - 1 - (w + k - 1)) + ((w + k - 1 - (len - 1 - min.y)) % w);
-		mm_push_index(km, str, len, k, rid, 0, p, min_index);
+		int dist_to_front;
+		if (buf_pos >= min_pos) {
+			dist_to_front = buf_pos - min_pos;
+		} else {
+			dist_to_front = (w + k - t - 1) - min_pos + buf_pos;
+		}
+		int w_relative = w + k - 2 - dist_to_front;
+		int min_index = w_relative % w;
+		int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
+		int glbl_relative = buf[buf_relative].y >> 8;
+
+		mm_push_index(km, str, len, k, rid, 0, p, glbl_relative);
 	}
 }
 
