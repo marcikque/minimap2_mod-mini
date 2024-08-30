@@ -383,7 +383,7 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
  * @param i		 index of kmer to push
  */
 
-void mm_push_kmer(void *km, mm128_v *p, mm128_t *buf, idx_info *idx_vars, kmer_info *kmer_vars, )
+void mm_push_kmer(void *km, mm128_v *p, mm128_t *buf, idx_info *idx_vars, kmer_info *kmer_vars)
 {
 	mm128_t target_tmer;
 	// special case for "old minimum moved out of the window (buffer)"
