@@ -58,8 +58,22 @@ static inline int tq_shift(tiny_queue_t *q)
 	return x;
 }
 
+typedef struct {		// kmer selection information
+	int k;				// kmer length
+	int w;				// window size
+	int t;				// tmer length
+	int buf_pos;		// current ring-buffer position
+	int w_relative;		// mod-sampled element's position relative to current window
+} idx_info;
 
-void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int is_hpc, mm128_v *p, int i, int ID);
+typedef struct {		// kmer construction information
+	const char *str;	// sequence
+	int len;			// sequence length
+	uint32_t rid;		// reference ID
+	int is_hpc;			// enable homopolymer-compression
+} kmer_info;
+
+void mm_push_kmer(void *km, const char *str, int len, int k, uint32_t rid, int is_hpc, mm128_v *p, int i);
 
 /**
  * Find symmetric (w,k)-minimizers on a DNA sequence
@@ -80,8 +94,6 @@ void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int 
  */
 void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, int is_hpc, mm128_v *p)
 {
-	
-	
 	// "The mod-minimizer: a simple and efficientsampling algorithm for long k-mers"
 	int r = (int) ceil(log2(w+k-1) / 2) + 1; // r=4 default | TODO: Threshold experiment
 	int t = r + ((k-r) % w); // Section 4.2 (11:13), Def. 16
@@ -105,7 +117,8 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 	kv_resize(mm128_t, km, *p, p->n + len/w);
 
 	for (int i = 0; i < len; ++i) {
-		mm128_t info;
+		mm128_t info = { UINT64_MAX, 0 }; //FIXME: info containing max might get pushed with mod as buffer filles with MAXMAX
+			// -> saveguard to check for info.x,.y==MAX
 		int c = seq_nt4_table[(uint8_t)str[i]];
 
 		if (c < 4) { // not an ambiguous base
@@ -143,13 +156,8 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				info.x = hash64(tmer[z], mask) << 8 | tmer_span; 
 				// tmer.x[63:8] = tmer[z] hashed, trimmed
 				// tmer.x[7:0]  = tmer_span
-				//int temp = t > i? 0 : i-t+1;
-				info.y = (uint64_t)(i - tmer_span + 1) << 8; 
-				//assert(tmer_span < len);
-
-				//fprintf(stderr, "Checking Creation: i = %d, len = %d\n", tmer_span, len);
-				// tmer.y[63:9] = global starting position
-				// tmer.y[7:0] = buffer position
+				info.y = i - tmer_span + 1; 
+				// tmer.y[63:0] = global starting position
 			}
 		} else {
 			l = 0;
@@ -168,6 +176,12 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 			(which is always at the very end of the very last tmer: position w-1+k-1)
 		*/
 
+		/*
+		issue: due to modulo, some of the resulting indices point to buffer positions that contain UINT64_MAX
+		result: invalid kmers and sequence accesses
+		solution: instead of starting index of the kmer, we now transmit the tmer to check for invalid tmers
+		*/
+
 		// special case: 1st window identical kmers
 		if (l == w + k - 1 && min.x != UINT64_MAX) {
 			int w_relative = 0;
@@ -178,74 +192,53 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 					// get the buffer position that represents the new mod-minimizer position
 					int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
 					// get the global starting index for kmer calculation
-					int glbl_relative = buf[buf_relative].y >> 8;
-
-					mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 1);
+					int glbl_relative = buf[buf_relative].y;
+					mm_push_kmer(km, str, len, k, rid, 0, p, glbl_relative);
 				}
 			}
 			for (int j = 0; j < buf_pos; ++j, ++w_relative) {
 				if (min.x == buf[j].x && buf[j].y != min.y) {
 					int min_index = w_relative % w;
 					int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
-					int glbl_relative = buf[buf_relative].y >> 8;
-
-					mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 2);
+					int glbl_relative = buf[buf_relative].y;
+					mm_push_kmer(km, str, len, k, rid, 0, p, glbl_relative);
 				}
 			}	
 			
 		}
 
-
-		// TODO: multi-tmer support (min becomes a list of tuples (min, buf_pos) or list of singles with lowest 8bit of y buf_pos)
-		// TODO: split cases:
-			// 1. info.x < min.x
-			// 2. info.x == min.x
-			// 3. info.x > min.x
-		// TODO: implement shifting
-
 		// case: new minimum found, push the old one
-		if (info.x <= min.x) {
+		if (info.x <= min.x) { 
 			if (l >= w + k && min.x != UINT64_MAX) {
 				// the old min was the min of the previous window
-				// operate relative to previous window
-				int dist_to_front;
-				if (buf_pos >= min_pos) {
-					dist_to_front = buf_pos - min_pos;
+				// operate relative to previous window -> decrement buf_pos and shift into valid index
+				int prev_buf_pos = (buf_pos - 1 + w + k - t) % (w + k - t);
+				int w_relative;
+				if (prev_buf_pos >= min_pos) {
+					w_relative = (w + k - t - 1 - prev_buf_pos + min_pos); 
 				} else {
-					dist_to_front = (w + k - t - 1) - min_pos + buf_pos;
+					w_relative = (min_pos - prev_buf_pos - 1);
 				}
-				int w_relative = w + k - 2 - dist_to_front;
-				// -1 as it's the old window
-				int min_index = (w_relative - 1) % w;
-				int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
-				int glbl_relative = buf[buf_relative].y >> 8;
-
-				mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 3);
+				int min_index = w_relative % w;
+				int buf_relative = (prev_buf_pos + 1 + min_index) % (w + k - t);
+				int glbl_relative = buf[buf_relative].y;
+				mm_push_kmer(km, str, len, k, rid, 0, p, glbl_relative);
 			}
-			// clear and set the lowest 8bits to save buf_pos (useful for later)
-			info.y = info.y & ~0xFF;
-			info.y = info.y | (buf_pos & 0xFF);
 			min = info;
 			min_pos = buf_pos;
 			
 
 		//case: old minimum moved out of the window (buffer)
-		} else if (buf_pos == min_pos) { 
+		} else if (buf_pos == min_pos) {
 			if (l >= w + k - 1 && min.x != UINT64_MAX) {
 				// old min had to be at index 0 of previous window
-				int glbl_relative = min.y >> 8;
-				if (len < glbl_relative) {
-					fprintf(stderr, "Checking assertion: i = %d, len = %d\n", glbl_relative, len);
-
-				}
-				mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 4);
+				int glbl_relative = min.y;
+				mm_push_kmer(km, str, len, k, rid, 0, p, glbl_relative);
 			}
 
 			min.x = UINT64_MAX;
 			for (int j = buf_pos + 1; j <  w + k - t; ++j) {
 				if (min.x >= buf[j].x) {
-					buf[j].y = buf[j].y & ~0xFF;
-					buf[j].y = buf[j].y | (j & 0xFF);
 					min = buf[j];
 					min_pos = j;
 				}
@@ -258,23 +251,22 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 			}
 
 			if (l >= w + k - 1 && min.x != UINT64_MAX) {
+				// simply: the for loops ensure that we go through the window in order, starting at pos 0 (1 after buf_pos)
 				int w_relative = 0;
 				for (int j = buf_pos + 1; j < w + k - t; ++j, ++w_relative) {
 					if (min.x == buf[j].x && min.y != buf[j].y) {
 						int min_index = w_relative % w;
 						int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
-						int glbl_relative = buf[buf_relative].y >> 8;
-
-						mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 5);
+						int glbl_relative = buf[buf_relative].y;
+						mm_push_kmer(km, str, len, k, rid, 0, p, glbl_relative);
 					}
 				}
 				for (int j = 0; j <= buf_pos; ++j, ++w_relative) {
 					if (min.x == buf[j].x && min.y != buf[j].y) {
 						int min_index = w_relative % w;
 						int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
-						int glbl_relative = buf[buf_relative].y >> 8;
-
-						mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 6);
+						int glbl_relative = buf[buf_relative].y;
+						mm_push_kmer(km, str, len, k, rid, 0, p, glbl_relative);
 					}
 				}
 			}
@@ -283,19 +275,21 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 			buf_pos = 0;
 		}
 	}
-	if (min.x != UINT64_MAX) {
-		int dist_to_front;
+	if (min.x != UINT64_MAX) { 
+		// PRE: j>=m: X = (w + k - t - 1 - j + m) % w
+		// POST: j<m: X = (m - j - 1) % w
+
+		// Translate back: (X + j + 1) % (w+k-t)
+		int w_relative;
 		if (buf_pos >= min_pos) {
-			dist_to_front = buf_pos - min_pos;
+			w_relative = (w + k - t - 1 - buf_pos + min_pos); 
 		} else {
-			dist_to_front = (w + k - t - 1) - min_pos + buf_pos;
+			w_relative = (min_pos - buf_pos - 1);
 		}
-		int w_relative = w + k - 2 - dist_to_front;
 		int min_index = w_relative % w;
 		int buf_relative = (buf_pos + 1 + min_index) % (w + k - t);
-		int glbl_relative = buf[buf_relative].y >> 8;
-
-		mm_push_index(km, str, len, k, rid, 0, p, glbl_relative, 7);
+		int glbl_relative = buf[buf_relative].y;
+		mm_push_kmer(km, str, len, k, rid, 0, p, glbl_relative);
 	}
 }
 
@@ -312,23 +306,17 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
  * @param p      minimizers
  * @param i		 index of kmer to push
  */
-void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int is_hpc, mm128_v *p, int i, int ID) {
-	
-	
-	
-	if (len <= i) {
-		fprintf(stderr, "Checking assertion: i = %d, len = %d\n", i, len);
-		assert(ID != 1);
-		assert(ID != 2);
-		assert(ID != 3);
-		assert(ID != 4);
-		assert(ID != 5);
-		assert(ID != 6);
-		assert(ID != 7);
-	}
-	
-	assert(i >= 0);
-	assert(len > i);
+
+//needs w, w_relative, buf_pos, buf pointer, t, jump_over via indicator w_relative -1
+// TODO: introduce structs
+	// idx vars: k, w, t, buf_pos, w_relative
+	// kmer relevant: rid, str, len, is_hpc
+	// others: (non struct) buf pointer, km, p
+
+// void mm_push_kmer(void *km, mm128_v *p, mm128_t *buf, idx_info *idx_vars, kmer_info *kmer_vars) {}
+void mm_push_kmer(void *km, const char *str, int len, int k, uint32_t rid, int is_hpc, mm128_v *p, int i) 
+{
+	assert(i >= 0 && len > i);
 
 	uint64_t shift1 = 2 * (k - 1);
 	uint64_t mask = (1ULL<<2*k) - 1; 
@@ -369,15 +357,20 @@ void mm_push_index(void *km, const char *str, int len, int k, uint32_t rid, int 
 		return;
 	}
 
-	if (l == k && kmer_span < 256) {
+	if (l >= k && kmer_span < 256) {
+		
+
 		mm128_t info = { UINT64_MAX, UINT64_MAX };
 		int z = kmer[0] < kmer[1]? 0 : 1;
 
 		info.x = hash64(kmer[z], mask) << 8 | kmer_span; 
 		// kmer.x[63:8] = kmer[z] hashed, trimmed
 		// kmer.x[7:0]  = kmer_span
-
-		info.y = (uint64_t)rid<<32 | (uint32_t)j<<1 | z;
+		if (j < 0 || j > len) {
+			fprintf(stderr, "Check DCCCC: i = %d, j = %d, l = %d, len = %d\n", i, j, l, len);
+			assert(0);
+		}
+		info.y = (uint64_t)rid<<32 | (uint32_t)0<<1 | z; //FIXME: Logic inconsistency due to j (0) being erronerous
 		// kmer.y[63:31] = sequence ref. ID
 		// kmer.y[7:1]   = last position
 		// kmer.y[0]     = strand
