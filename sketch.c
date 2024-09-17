@@ -95,9 +95,9 @@ void mm_push_kmer(void *km, mm128_v *p, mm128_t *buf, idx_info *idx_vars, kmer_i
 void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, int is_hpc, mm128_v *p)
 {
 	// "The mod-minimizer: a simple and efficientsampling algorithm for long k-mers"
-	int r = (int) ceil(log2(w+k-1) / 2) + 1; // r=4 default | TODO: Threshold experiment
+	int r = 4; //(int) ceil(log2(w+k-1) / 2) + 1; // r=4 default | TODO: Threshold experiment
 	int t = r + ((k-r) % w); // Section 4.2 (11:13), Def. 16
-	assert(k > r); 
+	assert(k >= r); 
 
 	uint64_t shift1 = 2 * (t - 1);
 	uint64_t mask = (1ULL<<2*t) - 1;
