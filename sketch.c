@@ -79,7 +79,29 @@ int static mm_calc_idx(int w, int i, int k, mm128_t min, int w_start, hpc_info *
 void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars);
 
 /**
- * Find symmetric (w,k)-minimizers on a DNA sequence
+ * Find (w,k)-minimizers on a DNA sequence using the mod-minimizer scheme:
+ * 		"The mod-minimizer: a simple and efficientsampling algorithm for long k-mers"
+ * 		Ragnar Groot Koerkamp, Giulio Ermanno Pibiri
+ *		bioRxiv 2024.05.25.595898; doi: https://doi.org/10.1101/2024.05.25.595898
+ * 
+ * Notation:
+ *  - tmer 		: newly constructed tmer by removing the first base and appending the new base
+ * 	- W 		: set of tmers in current window
+ *  - tmer_i 	: i-th tmer of the window
+ *  - kmer_i 	: k-th kmer of the window
+ *  - h(a) 		: hash of a
+ *  - rc(a) 	: reverse complement of a
+ *  - pos_W(a) 	: a's position within window W (0-indexed)
+ *  - M 		: list of minimizers
+ *
+ * Procedure: using a sliding window, construct the entering tmer
+ * 	1. W = W \ {W_0}
+ * 	2. def. info = min( h(tmer) , h(rc(tmer)) )
+ * 	3. W = W + {info}
+ * 	4. def. min = min(W)
+ * 	5. def. p = pos_W(min)
+ * 	6. def. kmer = min( h(kmer_p)) , h(rc(kmer_p)) )
+ * 	7. M = M + {kmer}
  *
  * @param km     thread-local memory pool; using NULL falls back to malloc()
  * @param str    DNA sequence
@@ -97,7 +119,7 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars);
  */
 void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, int is_hpc, mm128_v *p)
 {
-	// "The mod-minimizer: a simple and efficientsampling algorithm for long k-mers"
+	
 	int r = 4; //(int) ceil(log2(w+k-1) / 2) + 1; dynamic way with needed threshold
 	int t = r + ((k-r) % w);
 	assert(k >= r); // safeguard
@@ -105,11 +127,11 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 	uint64_t shift1 = 2 * (t - 1);
 	uint64_t mask = (1ULL<<2*t) - 1;
 	uint64_t tmer[2] = {0,0};
-	int l = 0;
-	int w_start = 0;
+	int l = 0; // bases processed since last reset/start
+	int w_start = 0; // starting index of the current window
 	int buf_pos = 0;
 	int min_pos = 0;
-	int tmer_span = 0;
+	int tmer_span = 0; // bases included in the current tmer (default t, changes under HPC)
 	int prev_push = -1;
 	mm128_t buf[256];
 	mm128_t min = { UINT64_MAX, UINT64_MAX };
@@ -151,6 +173,7 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				// next base same? -> loop till different
 				// e.g. GTAAAACTG -> GTACTG
 				int skip_len = 1;
+				// case: next base is identical to current
 				if (i + 1 < len && seq_nt4_table[(uint8_t)str[i + 1]] == c) {
 					for (skip_len = 2; i + skip_len < len; ++skip_len) {
 						if (seq_nt4_table[(uint8_t)str[i + skip_len]] != c) {
@@ -160,7 +183,7 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 					i += skip_len - 1;
 				}
 				tq_push(&tq, skip_len);
-				tmer_span += skip_len;
+				tmer_span += skip_len; // count number of bases within tmer, can be >t
 				if (tq.count > t) {
 					tmer_span -= tq_shift(&tq);
 				} 
@@ -168,8 +191,8 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				tmer_span = l + 1 < t? l + 1 : t;
 			}
 
-			tmer[0] = (tmer[0] << 2 | c) & mask;           // forward t-mer
-			tmer[1] = (tmer[1] >> 2) | (3ULL^c) << shift1; // reverse t-mer: reverse & A<->T, C<->G
+			tmer[0] = (tmer[0] << 2 | c) & mask;           // forward t-mer: remove first base, append new base
+			tmer[1] = (tmer[1] >> 2) | (3ULL^c) << shift1; // reverse t-mer: remove last base, prepend complement of new base (A<->T, C<->G)
 
 			if (tmer[0] == tmer[1]) {
 				continue; // symmetric tmer, strand unknown
@@ -315,7 +338,7 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars)
 	uint64_t shift1 = 2 * (kmer_vars->k - 1);
 	uint64_t mask = (1ULL<<2*kmer_vars->k) - 1; 
 	uint64_t kmer[2] = {0,0};
-	int kmer_span = 0;
+	int kmer_span = 0; // bases included in the current kmer (default k, changes under HPC)
 	int l = 0;
 	int j;
 
