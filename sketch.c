@@ -58,7 +58,7 @@ static inline int tq_shift(tiny_queue_t *q)
 	return x;
 }
 
-typedef struct {		// kmer construction information
+typedef struct {		// kmer construction information, constant
 	int k;
 	const char *str;	// sequence
 	int len;			// sequence length
@@ -66,7 +66,15 @@ typedef struct {		// kmer construction information
 	int is_hpc;			// enable homopolymer-compression
 } kmer_info;
 
-int static mm_calc_idx(int w, int i, int k, mm128_t min);
+typedef struct {		// hpc handling information
+	int is_hpc;			// propagates hpc enabling
+	mm128_t *buf;		// pointer to ring buffer
+	int *buf_pos;		// pointer to variable holding current pos in ring buffer
+	int t;				
+	int *min_pos;		// pointer to variable holding pos of current minimizer within the buffer
+} hpc_info;
+
+int static mm_calc_idx(int w, int i, int k, mm128_t min, int w_start, hpc_info *hpc_vars);
 
 void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars);
 
@@ -90,14 +98,15 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars);
 void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, int is_hpc, mm128_v *p)
 {
 	// "The mod-minimizer: a simple and efficientsampling algorithm for long k-mers"
-	int r = 4; //(int) ceil(log2(w+k-1) / 2) + 1; // r=4 default | TODO: Threshold experiment
-	int t = r + ((k-r) % w); // Section 4.2 (11:13), Def. 16
-	assert(k >= r); 
+	int r = 4; //(int) ceil(log2(w+k-1) / 2) + 1; dynamic way with needed threshold
+	int t = r + ((k-r) % w);
+	assert(k >= r); // safeguard
 
 	uint64_t shift1 = 2 * (t - 1);
 	uint64_t mask = (1ULL<<2*t) - 1;
 	uint64_t tmer[2] = {0,0};
 	int l = 0;
+	int w_start = 0;
 	int buf_pos = 0;
 	int min_pos = 0;
 	int tmer_span = 0;
@@ -105,6 +114,22 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 	mm128_t buf[256];
 	mm128_t min = { UINT64_MAX, UINT64_MAX };
 	tiny_queue_t tq;
+
+	// creating the necessary structs to call mm_push_kmer to improve readability and reduce duplicate code
+	hpc_info hpc_vars = {
+		.is_hpc = is_hpc,
+		.buf = buf,
+		.buf_pos = &buf_pos,	
+		.t = t,
+		.min_pos = &min_pos
+	};
+	kmer_info kmer_vars = {
+		.k = k,
+		.str = str,
+		.len = len,
+		.rid = rid,
+		.is_hpc = is_hpc
+	};
 
 	assert(len > 0 && (w > 0 && w < 256) && (k > 0 && k <= 28)); // 56bits for kmers, 8bits for metadata
 
@@ -116,9 +141,14 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 		mm128_t info = { UINT64_MAX, UINT64_MAX }; 
 		int c = seq_nt4_table[(uint8_t)str[i]];
 
+		// keeps track of the start of the current window, not skewed by HPC
+		if(l >= w + k - 1) {
+			++w_start;
+		}
+
 		if (c < 4) { // not an ambiguous base
 			if (is_hpc) {
-				// next base samne? -> loop till different
+				// next base same? -> loop till different
 				// e.g. GTAAAACTG -> GTACTG
 				int skip_len = 1;
 				if (i + 1 < len && seq_nt4_table[(uint8_t)str[i + 1]] == c) {
@@ -154,44 +184,38 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				info.y = i - tmer_span + 1;
 				// tmer.y[63:0] = global starting position
 			}
+		
+		// resetting, essentially splitting the sequence, at unambigious bases
 		} else {
 			l = 0;
 			tq.count = 0;
 			tq.front = 0;
 			tmer_span = 0;
-			min = (mm128_t){ UINT64_MAX, UINT64_MAX };
 			buf_pos = 0;
 			min_pos = 0;
+			min = (mm128_t){ UINT64_MAX, UINT64_MAX };
 		}
 
 		buf[buf_pos] = info;
 
-		// new minimum found
+		// case: new minimum found
 		if (info.x < min.x) {
 			min = info;
 			min_pos = buf_pos;
-			// check if we fully processed the first window
-			if (l >= w + k) {
-				prev_push = mm_calc_idx(w, i, k, min);
-				kmer_info kmer_vars = {
-						.k = k,
-						.str = str,
-						.len = len,
-						.rid = rid,
-						.is_hpc = is_hpc
-					};
+			
+			if (l >= w + k) { // check if we fully processed the first window
+				prev_push = mm_calc_idx(w, i, k, min, w_start, &hpc_vars);
 				mm_push_kmer(km, p, prev_push, &kmer_vars);
 			}
 
-		// old minimum left the window &&
-		// check if we fully processed the first window
-		} else if (buf_pos == min_pos && l >= w + k) {
+		// case: old minimum left the window 
+		} else if (buf_pos == min_pos && l >= w + k) { // && check if we fully processed the first window
 			min.x = UINT64_MAX;
 
 			// scan for the leftmost minimal element
-			int window_relative;
-			for (window_relative = 0; window_relative < w + k - t; ++window_relative) {
-				int wrapped_index = (buf_pos + 1 + window_relative) % (w + k - t);
+			int w_relative;
+			for (w_relative = 0; w_relative < w + k - t; ++w_relative) {
+				int wrapped_index = (buf_pos + 1 + w_relative) % (w + k - t);
 
 				if (buf[wrapped_index].x < min.x) {
 					min = buf[wrapped_index];
@@ -199,45 +223,23 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				}
 			}
 
-			prev_push = mm_calc_idx(w, i, k, min);
-			kmer_info kmer_vars = {
-					.k = k,
-					.str = str,
-					.len = len,
-					.rid = rid,
-					.is_hpc = is_hpc
-				};
+			prev_push = mm_calc_idx(w, i, k, min, w_start, &hpc_vars);
 			mm_push_kmer(km, p, prev_push, &kmer_vars);
 			
-		// consecutive windows have the same minimizing tmer
+		// case: consecutive windows share minimizing tmer
 		} else {
-			int next_push = mm_calc_idx(w, i, k, min);
+			int next_push = mm_calc_idx(w, i, k, min, w_start, &hpc_vars);
 
-			// check if the tmer mod-samples a new kmer &&
-			// check if we fully processed the first window
-			if (prev_push != next_push && l >= w + k) { 
+			// check if the tmer mod-samples a new kmer 
+			if (prev_push != next_push && l >= w + k) { // && check if we fully processed the first window
 				prev_push = next_push;
-				kmer_info kmer_vars = {
-						.k = k,
-						.str = str,
-						.len = len,
-						.rid = rid,
-						.is_hpc = is_hpc
-					};
 				mm_push_kmer(km, p, prev_push, &kmer_vars);
 			}
 		}
 
-		//1st Window special case: push leftmost minimizer as soon as whole window is processd
+		// case: 1st window is fully processed, not partial anymore, we need to push its minimizer
 		if (l == w + k - 1) {
-			prev_push = mm_calc_idx(w, i, k, min);
-			kmer_info kmer_vars = {
-					.k = k,
-					.str = str,
-					.len = len,
-					.rid = rid,
-					.is_hpc = is_hpc
-				};
+			prev_push = mm_calc_idx(w, i, k, min, w_start, &hpc_vars);
 			mm_push_kmer(km, p, prev_push, &kmer_vars);
 		}
 
@@ -252,17 +254,49 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 /** 
  * Calculates the starting index of the kmer to push to the list of minimizers
  * Scheme: mod-minimizer, minimizing tmer at pos x, window starts at pos s -> push kmer at s + ((x - s) mod w)
- * @param w window length
- * @param i current sequence processing index
- * @param k kmer length
- * @param min minimizing tmer in the current window
+ * Note: HPC makes the normal scheme unusable as compression skews sequence indices
+ * @param w 		window length
+ * @param i 		current sequence processing index
+ * @param k 		kmer length
+ * @param min 		minimizing tmer in the current window
+ * @param w_start 	index of the start of the window
+ * @param hpc_vars 	contains information to support HPC
 */
-// FIXME: make HPC ready
-int static mm_calc_idx(int w, int i, int k, mm128_t min) {
-	int w_start = i - (w + k - 2);
-	int glbl_index = w_start + ((min.y - w_start) % w);
+int static mm_calc_idx(int w, int i, int k, mm128_t min, int w_start, hpc_info *hpc_vars) {
+	// case: hpc is disabled
+	if (!hpc_vars->is_hpc) {
+		// the kmer to sample is at position: w_start + ((tmer_pos - w_start) mod w)
+		int glbl_index = w_start + ((min.y - w_start) % w);
+		return glbl_index;
+	}
 
-	return glbl_index;
+	// case: hpc enabled
+	// problem: 	window starting index cannot be calculated via formula as consecutive identical bases are ignored
+	// solution: 	window starting index calculation by incrementing w_start instead of using a formula
+	// problem: 	position ws + ((p - ws) mod w) doesnt correspond to the right kmer anymore as compression skews the indices (j-th kmer doesnt have to start at index j-1)
+	// solution: 	tmer's within ring buffer contain correct starting position and numbering (j-th tmer starts at index j-1) -> do buffer calculations
+
+	// 1. calculate the minimizer's position within the current window
+	// we know that buf_pos points to the last tmer within the current window
+	int window_pos;
+	if (*hpc_vars->min_pos > *hpc_vars->buf_pos) {
+		window_pos = *hpc_vars->min_pos - *hpc_vars->buf_pos - 1; 
+	} else {
+		window_pos = (w + k - hpc_vars->t) - *hpc_vars->buf_pos + *hpc_vars->min_pos - 1;
+	}
+
+	// 2. modulo according to our scheme
+	window_pos %= w;
+
+	// 3. calculate the index within the buffer of the tmer at window_pos in our current window
+	// buf[buf_pos + 1] always contains the very first tmer of our window
+	int target_pos = (*hpc_vars->buf_pos + 1 + window_pos) % (w + k - hpc_vars->t);
+
+	// 4. retrieve corresponding tmer
+	mm128_t target = hpc_vars->buf[target_pos];
+
+	// 5. retrieve the starting index
+	return target.y;
 }
 
 
@@ -272,9 +306,8 @@ int static mm_calc_idx(int w, int i, int k, mm128_t min) {
  * @param km 			thread-local memory pool; using NULL falls back to malloc()
  * @param p 			list of minimizers
  * @param glbl_index 	index of kmer to push
- * @param kmer_vars 	constant variables needed for kmer construction
+ * @param kmer_vars 	information needed for kmer construction
  */
-
 void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars)
 {
 	assert(glbl_index >= 0 && glbl_index < kmer_vars->len); // safeguard
@@ -319,7 +352,6 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars)
 	}
 
 	if (l >= kmer_vars->k && kmer_span < 256) {
-		
 		mm128_t info = { UINT64_MAX, UINT64_MAX };
 		int z = kmer[0] < kmer[1]? 0 : 1;
 
