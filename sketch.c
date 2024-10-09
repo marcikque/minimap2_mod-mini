@@ -80,26 +80,26 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars);
 
 /**
  * Find (w,k)-minimizers on a DNA sequence using the mod-minimizer scheme:
- * 		"The mod-minimizer: a simple and efficientsampling algorithm for long k-mers"
+ * 		"The mod-minimizer: a simple and efficient sampling algorithm for long k-mers"
  * 		Ragnar Groot Koerkamp, Giulio Ermanno Pibiri
  *		bioRxiv 2024.05.25.595898; doi: https://doi.org/10.1101/2024.05.25.595898
  * 
  * Notation:
- *  - tmer 		: newly constructed tmer by removing the first base and appending the new base
- * 	- W 		: set of tmers in current window
- *  - tmer_i 	: i-th tmer of the window
- *  - kmer_i 	: k-th kmer of the window
- *  - h(a) 		: hash of a
- *  - rc(a) 	: reverse complement of a
- *  - pos_W(a) 	: a's position within window W (0-indexed)
- *  - M 		: list of minimizers
+ *  tmer : newly constructed tmer by removing the first base and appending the new base
+ *  W : set of tmers in current window
+ *  tmer_i : i-th tmer of the window
+ *  kmer_i : k-th kmer of the window
+ *  h(a) : hash of a
+ *  rc(a) : reverse complement of a
+ *  pos_W(a) : a's position within window W (0-indexed)
+ *  M : list of minimizers
  *
  * Procedure: using a sliding window, construct the entering tmer
  * 	1. W = W \ {W_0}
  * 	2. def. info = min( h(tmer) , h(rc(tmer)) )
  * 	3. W = W + {info}
  * 	4. def. min = min(W)
- * 	5. def. p = pos_W(min)
+ * 	5. def. p = pos_W(min) mod w
  * 	6. def. kmer = min( h(kmer_p)) , h(rc(kmer_p)) )
  * 	7. M = M + {kmer}
  *
@@ -119,7 +119,6 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars);
  */
 void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, int is_hpc, mm128_v *p)
 {
-	
 	int r = 4; //(int) ceil(log2(w+k-1) / 2) + 1; dynamic way with needed threshold
 	int t = r + ((k-r) % w);
 	assert(k >= r); // safeguard
