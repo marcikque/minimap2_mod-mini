@@ -119,9 +119,9 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars);
  */
 void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, int is_hpc, mm128_v *p)
 {
-	int r = 4; //(int) ceil(log2(w+k-1) / 2) + 1; dynamic way with needed threshold
+	// k >= r should hold
+	int r = 4; //(int) ceil(log2(w+k-1) / 2) + 1; //dynamic way with needed threshold
 	int t = r + ((k-r) % w);
-	assert(k >= r); // safeguard
 
 	uint64_t shift1 = 2 * (t - 1);
 	uint64_t mask = (1ULL<<2*t) - 1;
@@ -332,7 +332,7 @@ int static mm_calc_idx(int w, int i, int k, mm128_t min, int w_start, hpc_info *
  */
 void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars)
 {
-	assert(glbl_index >= 0 && glbl_index < kmer_vars->len); // safeguard
+	assert(glbl_index >= 0 && glbl_index < kmer_vars->len); // should never happen
 
 	uint64_t shift1 = 2 * (kmer_vars->k - 1);
 	uint64_t mask = (1ULL<<2*kmer_vars->k) - 1; 
@@ -369,6 +369,10 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars)
 		++l;
 	}
 
+	if (j == kmer_vars->len) { // loop ended because of j<len condition: edge case if kmer ends at last pos in sequence
+		--j;
+	}
+
 	if (kmer[0] == kmer[1]) { // symmetric kmer, strand unknown
 		return;
 	}
@@ -384,7 +388,7 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars)
 		// kmer.y[63:32] = sequence ref. ID
 		// kmer.y[31:1]  = last position
 		// kmer.y[0]     = strand
-
+		assert(j >= 0 && j < kmer_vars->len); // replaces asserts in assign.c (more comprehensive)
 		kv_push(mm128_t, km, *p, info);
 	}
 }
