@@ -357,6 +357,7 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars)
 						break;
 					}
 				}
+				j += skip_len - 1;
 				
 			}
 			kmer_span += skip_len;
@@ -388,6 +389,7 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars)
 		// kmer.y[63:32] = sequence ref. ID
 		// kmer.y[31:1]  = last position
 		// kmer.y[0]     = strand
+		
 		assert(j >= 0 && j < kmer_vars->len); // replaces asserts in assign.c (more comprehensive)
 		kv_push(mm128_t, km, *p, info);
 	}
