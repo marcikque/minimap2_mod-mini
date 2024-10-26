@@ -58,25 +58,25 @@ static inline int tq_shift(tiny_queue_t *q)
 	return x;
 }
 
-typedef struct {		// kmer construction information, constant
-	int k;
-	const char *str;	// sequence
-	int len;			// sequence length
-	uint32_t rid;		// reference ID
-	int is_hpc;			// enable homopolymer-compression
+
+typedef struct {		// struct to simplify mm_push_kmer's arguments (improves readability and reduces duplicate code)
+	void *km;			// thread-local memory pool
+	mm128_v *p;
+
+	mm128_t *min;		// pointer to current minimal element
+	int *min_pos;		// pointer to variable holding pos of current minimizer within tmer buffer
+
+	mm128_t *buf;		// ring buffer containing tmers
+	int *buf_pos;		// pointer to variable holding current pos in tmer's ring buffer
+
+	mm128_t *k_buf;		// ring buffer containing kmers
+	int *k_buf_pos;		// pointer to variable holding current pos in kmer's ring buffer
+
+	int *prev_push;		// position of last pushed kmer within the sequence
+	int len;			// length of DNA sequence
 } kmer_info;
 
-typedef struct {		// hpc handling information
-	int is_hpc;			// propagates hpc enabling
-	mm128_t *buf;		// pointer to ring buffer
-	int *buf_pos;		// pointer to variable holding current pos in ring buffer
-	int t;				
-	int *min_pos;		// pointer to variable holding pos of current minimizer within the buffer
-} hpc_info;
-
-int static mm_calc_idx(int w, int i, int k, mm128_t min, int w_start, hpc_info *hpc_vars);
-
-void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars);
+int static mm_push_kmer(int w, int k, int t, kmer_info *kmer_vars);
 
 /**
  * Find (w,k)-minimizers on a DNA sequence using the mod-minimizer scheme:
@@ -120,52 +120,56 @@ void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars);
 void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, int is_hpc, mm128_v *p)
 {
 	// k >= r should hold
-	int r = 4; //(int) ceil(log2(w+k-1) / 2) + 1; //dynamic way with needed threshold
+	int r = (int) ceil(log2(w+k-1) / 2) + 1; //default: w = 10, k = 15, r = 4
 	int t = r + ((k-r) % w);
 
 	uint64_t shift1 = 2 * (t - 1);
 	uint64_t mask = (1ULL<<2*t) - 1;
 	uint64_t tmer[2] = {0,0};
 	int l = 0; // bases processed since last reset/start
-	int w_start = 0; // starting index of the current window
 	int buf_pos = 0;
 	int min_pos = 0;
 	int tmer_span = 0; // bases included in the current tmer (default t, changes under HPC)
-	int prev_push = -1;
+	int prev_push = -1; // saves last pushed kmer's position within the sequence
 	mm128_t buf[256];
 	mm128_t min = { UINT64_MAX, UINT64_MAX };
 	tiny_queue_t tq;
 
-	// creating the necessary structs to call mm_push_kmer to improve readability and reduce duplicate code
-	hpc_info hpc_vars = {
-		.is_hpc = is_hpc,
+	// variables needed for simultaneous kmer creation
+	uint64_t k_shift1 = 2 * (k - 1);
+	uint64_t k_mask = (1ULL<<2*k) - 1;
+	uint64_t kmer[2] = {0,0};
+	int k_buf_pos = 0;
+	int kmer_span = 0;
+	mm128_t k_buf[256];
+	tiny_queue_t k_tq;
+
+	// creating the necessary structs to call mm_push_kmer
+	kmer_info kmer_vars = {
+		.km = km,
+		.p = p,
+		.min = &min,
+		.min_pos = &min_pos,
 		.buf = buf,
 		.buf_pos = &buf_pos,	
-		.t = t,
-		.min_pos = &min_pos
-	};
-	kmer_info kmer_vars = {
-		.k = k,
-		.str = str,
-		.len = len,
-		.rid = rid,
-		.is_hpc = is_hpc
+		.k_buf = k_buf,
+		.k_buf_pos = &k_buf_pos,
+		.prev_push = &prev_push,
+		.len = len
 	};
 
 	assert(len > 0 && (w > 0 && w < 256) && (k > 0 && k <= 28)); // 56bits for kmers, 8bits for metadata
 
 	memset(buf, 0xff, (w + k - t) * 16);
 	memset(&tq, 0, sizeof(tiny_queue_t));
+	memset(k_buf, 0xff, w * 16);
+	memset(&k_tq, 0, sizeof(tiny_queue_t));
 	kv_resize(mm128_t, km, *p, p->n + len/w);
 
 	for (int i = 0; i < len; ++i) {
 		mm128_t info = { UINT64_MAX, UINT64_MAX }; 
+		mm128_t k_info = { UINT64_MAX, UINT64_MAX }; 
 		int c = seq_nt4_table[(uint8_t)str[i]];
-
-		// keeps track of the start of the current window, not skewed by HPC
-		if(l >= w + k - 1) {
-			++w_start;
-		}
 
 		if (c < 4) { // not an ambiguous base
 			if (is_hpc) {
@@ -182,16 +186,27 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 					i += skip_len - 1;
 				}
 				tq_push(&tq, skip_len);
+				tq_push(&k_tq, skip_len);
+
 				tmer_span += skip_len; // count number of bases within tmer, can be >t
+				kmer_span += skip_len;
 				if (tq.count > t) {
 					tmer_span -= tq_shift(&tq);
 				} 
+				if (k_tq.count > k) {
+					kmer_span -= tq_shift(&k_tq);
+				} 
 			} else {
 				tmer_span = l + 1 < t? l + 1 : t;
+				kmer_span = l + 1 < k? l + 1 : k;
 			}
 
 			tmer[0] = (tmer[0] << 2 | c) & mask;           // forward t-mer: remove first base, append new base
 			tmer[1] = (tmer[1] >> 2) | (3ULL^c) << shift1; // reverse t-mer: remove last base, prepend complement of new base (A<->T, C<->G)
+
+			kmer[0] = (kmer[0] << 2 | c) & k_mask;           // forward k-mer: remove first base, append new base
+			kmer[1] = (kmer[1] >> 2) | (3ULL^c) << k_shift1; // reverse k-mer: remove last base, prepend complement of new base (A<->T, C<->G)
+
 
 			if (tmer[0] == tmer[1]) {
 				continue; // symmetric tmer, strand unknown
@@ -206,6 +221,22 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				info.y = i - tmer_span + 1;
 				// tmer.y[63:0] = global starting position
 			}
+
+
+			if (kmer[0] == kmer[1]) {
+				continue; // symmetric tmer, strand unknown
+			}
+			int k_z = kmer[0] < kmer[1]? 0 : 1; // strand: forward or backward (lexicographically smaller is chosen)
+
+			if (l >= k && kmer_span < 256) {
+				k_info.x = hash64(kmer[k_z], k_mask) << 8 | kmer_span; 
+				// kmer.x[63:8] = kmer[k_z] hashed, trimmed
+				// kmer.x[7:0]  = kmer_span
+				k_info.y = (uint64_t)rid<<32 | (uint32_t)i<<1 | k_z;
+				// kmer.y[63:32] = sequence ref. ID
+				// kmer.y[31:1]  = last position
+				// kmer.y[0]     = strand
+			}
 		
 		// resetting, essentially splitting the sequence, at unambigious bases
 		} else {
@@ -214,11 +245,18 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 			tq.front = 0;
 			tmer_span = 0;
 			buf_pos = 0;
+
+			k_tq.count = 0;
+			k_tq.front = 0;
+			kmer_span = 0;
+			k_buf_pos = 0;
+
 			min_pos = 0;
 			min = (mm128_t){ UINT64_MAX, UINT64_MAX };
 		}
 
 		buf[buf_pos] = info;
+		k_buf[k_buf_pos] = k_info;
 
 		// case: new minimum found
 		if (info.x < min.x) {
@@ -226,8 +264,7 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 			min_pos = buf_pos;
 			
 			if (l >= w + k) { // check if we fully processed the first window
-				prev_push = mm_calc_idx(w, i, k, min, w_start, &hpc_vars);
-				mm_push_kmer(km, p, prev_push, &kmer_vars);
+				prev_push = mm_push_kmer(w, k, t, &kmer_vars);
 			}
 
 		// case: old minimum left the window 
@@ -245,152 +282,64 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 				}
 			}
 
-			prev_push = mm_calc_idx(w, i, k, min, w_start, &hpc_vars);
-			mm_push_kmer(km, p, prev_push, &kmer_vars);
+			prev_push = mm_push_kmer(w, k, t, &kmer_vars);
 			
 		// case: consecutive windows share minimizing tmer
 		} else {
-			int next_push = mm_calc_idx(w, i, k, min, w_start, &hpc_vars);
-
-			// check if the tmer mod-samples a new kmer 
-			if (prev_push != next_push && l >= w + k) { // && check if we fully processed the first window
-				prev_push = next_push;
-				mm_push_kmer(km, p, prev_push, &kmer_vars);
+			if (l >= w + k) { // check if we fully processed the first window
+				prev_push = mm_push_kmer(w, k, t, &kmer_vars);
 			}
 		}
 
 		// case: 1st window is fully processed, not partial anymore, we need to push its minimizer
 		if (l == w + k - 1) {
-			prev_push = mm_calc_idx(w, i, k, min, w_start, &hpc_vars);
-			mm_push_kmer(km, p, prev_push, &kmer_vars);
+			prev_push = mm_push_kmer(w, k, t, &kmer_vars);
 		}
 
-		//inc buffer
+		//inc tmer buffer position
 		if (++buf_pos == w + k - t) {
 			buf_pos = 0;
+		}
+
+		//inc kmer buffer position
+		if (++k_buf_pos == w) {
+			k_buf_pos = 0;
 		}
 	}
 }
 
 
 /** 
- * Calculates the starting index of the kmer to push to the list of minimizers
- * Scheme: mod-minimizer, minimizing tmer at pos x, window starts at pos s -> push kmer at s + ((x - s) mod w)
- * Note: HPC makes the normal scheme unusable as compression skews sequence indices
+ * Finds the kmer corresponding to the current minimal tmer in mod-minimizer fashion.
+ * If it has not been pushed yet, we push it (duplicate protection).
+ * Returns the kmer's last position for the next iteration's duplication check.
  * @param w 		window length
- * @param i 		current sequence processing index
  * @param k 		kmer length
- * @param min 		minimizing tmer in the current window
- * @param w_start 	index of the start of the window
- * @param hpc_vars 	contains information to support HPC
+ * @param t 		tmer length
+ * @param kmer_vars 	struct to simplify the arguments
 */
-int static mm_calc_idx(int w, int i, int k, mm128_t min, int w_start, hpc_info *hpc_vars) {
-	// case: hpc is disabled
-	if (!hpc_vars->is_hpc) {
-		// the kmer to sample is at position: w_start + ((tmer_pos - w_start) mod w)
-		int glbl_index = w_start + ((min.y - w_start) % w);
-		return glbl_index;
-	}
+int static mm_push_kmer(int w, int k, int t, kmer_info *kmer_vars) {
+	int buf_size = w + k - t;
+    int k_buf_size = w;
 
-	// case: hpc enabled
-	// problem: 	window starting index cannot be calculated via formula as consecutive identical bases are ignored
-	// solution: 	window starting index calculation by incrementing w_start instead of using a formula
-	// problem: 	position ws + ((p - ws) mod w) doesnt correspond to the right kmer anymore as compression skews the indices (j-th kmer doesnt have to start at index j-1)
-	// solution: 	tmer's within ring buffer contain correct starting position and numbering (j-th tmer starts at index j-1) -> do buffer calculations
-
-	// 1. calculate the minimizer's position within the current window
-	// we know that buf_pos points to the last tmer within the current window
-	int window_pos;
-	if (*hpc_vars->min_pos > *hpc_vars->buf_pos) {
-		window_pos = *hpc_vars->min_pos - *hpc_vars->buf_pos - 1; 
-	} else {
-		window_pos = (w + k - hpc_vars->t) - *hpc_vars->buf_pos + *hpc_vars->min_pos - 1;
-	}
-
-	// 2. modulo according to our scheme
+	// 1. calculate the minimal element's positon within the window
+	int window_pos = (*kmer_vars->min_pos - *kmer_vars->buf_pos + (buf_size - 1)) % buf_size;
+	// 2. mod-minimizer: modulo operation
 	window_pos %= w;
+	// 3. calculate the kmer buffer index of the window position
+	int k_buf_idx = (*kmer_vars->k_buf_pos + 1 + window_pos) % k_buf_size;
+	// 4. retrieve the corresponding kmer
+	mm128_t k_target = kmer_vars->k_buf[k_buf_idx];
 
-	// 3. calculate the index within the buffer of the tmer at window_pos in our current window
-	// buf[buf_pos + 1] always contains the very first tmer of our window
-	int target_pos = (*hpc_vars->buf_pos + 1 + window_pos) % (w + k - hpc_vars->t);
+    // retrieve the target's end position within the sequence
+    uint32_t k_target_glbl_pos = k_target.y;
+    k_target_glbl_pos >>= 1;
+    assert(k_target_glbl_pos >= 0 && k_target_glbl_pos < kmer_vars->len);
 
-	// 4. retrieve corresponding tmer
-	mm128_t target = hpc_vars->buf[target_pos];
+    // Push the k-mer if not already pushed
+    if (*kmer_vars->prev_push != k_target_glbl_pos) {
+        kv_push(mm128_t, kmer_vars->km, *kmer_vars->p, k_target);
+    }
 
-	// 5. retrieve the starting index
-	return target.y;
-}
-
-
-/**
- * Constructs and pushes the kmer starting at the given index
- *
- * @param km 			thread-local memory pool; using NULL falls back to malloc()
- * @param p 			list of minimizers
- * @param glbl_index 	index of kmer to push
- * @param kmer_vars 	information needed for kmer construction
- */
-void mm_push_kmer(void *km, mm128_v *p, int glbl_index, kmer_info *kmer_vars)
-{
-	assert(glbl_index >= 0 && glbl_index < kmer_vars->len); // should never happen
-
-	uint64_t shift1 = 2 * (kmer_vars->k - 1);
-	uint64_t mask = (1ULL<<2*kmer_vars->k) - 1; 
-	uint64_t kmer[2] = {0,0};
-	int kmer_span = 0; // bases included in the current kmer (default k, changes under HPC)
-	int l = 0;
-	int j;
-
-	for (j=glbl_index; j<kmer_vars->len && l<kmer_vars->k; ++j) {
-		int c = seq_nt4_table[(uint8_t)kmer_vars->str[j]];
-
-		if (c>=4) { // ambiguous base
-			return;
-		}
-
-		if (kmer_vars->is_hpc) {
-			int skip_len = 1;
-			if (j + 1 < kmer_vars->len && seq_nt4_table[(uint8_t)kmer_vars->str[j + 1]] == c) { 
-
-				for (skip_len = 2; j + skip_len < kmer_vars->len; ++skip_len) {
-					if (seq_nt4_table[(uint8_t)kmer_vars->str[j + skip_len]] != c) {
-						break;
-					}
-				}
-				j += skip_len - 1;
-				
-			}
-			kmer_span += skip_len;
-		} else {
-			++kmer_span;
-		}
-
-		kmer[0] = (kmer[0] << 2 | c) & mask;       		// forward kmer
-		kmer[1] = (kmer[1] >> 2) | (3ULL^c) << shift1;  // reverse tmer: reverse & A<->T, C<->G
-		++l;
-	}
-
-	if (j == kmer_vars->len) { // loop ended because of j<len condition: edge case if kmer ends at last pos in sequence
-		--j;
-	}
-
-	if (kmer[0] == kmer[1]) { // symmetric kmer, strand unknown
-		return;
-	}
-
-	if (l >= kmer_vars->k && kmer_span < 256) {
-		mm128_t info = { UINT64_MAX, UINT64_MAX };
-		int z = kmer[0] < kmer[1]? 0 : 1;
-
-		info.x = hash64(kmer[z], mask) << 8 | kmer_span; 
-		// kmer.x[63:8] = kmer[z] hashed, trimmed
-		// kmer.x[7:0]  = kmer_span
-		info.y = (uint64_t)kmer_vars->rid<<32 | (uint32_t)j<<1 | z;
-		// kmer.y[63:32] = sequence ref. ID
-		// kmer.y[31:1]  = last position
-		// kmer.y[0]     = strand
-		
-		assert(j >= 0 && j < kmer_vars->len); // replaces asserts in assign.c (more comprehensive)
-		kv_push(mm128_t, km, *p, info);
-	}
+    return k_target_glbl_pos;
 }
