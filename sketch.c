@@ -6,6 +6,7 @@
 #include "kvec.h"
 #include "mmpriv.h"
 #include "math.h"
+#include <time.h>
 
 unsigned char seq_nt4_table[256] = {
 	0, 1, 2, 3,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,
@@ -63,13 +64,9 @@ typedef struct {		// struct to simplify mm_push_kmer's arguments (improves reada
 	void *km;			// thread-local memory pool
 	mm128_v *p;
 
-	mm128_t *min;		// pointer to current minimal element
-	int *min_pos;		// pointer to variable holding pos of current minimizer within tmer buffer
-
-	mm128_t *buf;		// ring buffer containing tmers
-	int *buf_pos;		// pointer to variable holding current pos in tmer's ring buffer
-
 	mm128_t *k_buf;		// ring buffer containing kmers
+	int *min_pos;		// pointer to variable holding pos of current minimizer within tmer buffer
+	int *buf_pos;		// pointer to variable holding current pos in tmer's ring buffer
 	int *k_buf_pos;		// pointer to variable holding current pos in kmer's ring buffer
 
 	int *prev_push;		// position of last pushed kmer within the sequence
@@ -148,11 +145,9 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 	kmer_info kmer_vars = {
 		.km = km,
 		.p = p,
-		.min = &min,
-		.min_pos = &min_pos,
-		.buf = buf,
-		.buf_pos = &buf_pos,	
 		.k_buf = k_buf,
+		.min_pos = &min_pos,
+		.buf_pos = &buf_pos,	
 		.k_buf_pos = &k_buf_pos,
 		.prev_push = &prev_push,
 		.len = len
@@ -321,7 +316,6 @@ void mm_sketch(void *km, const char *str, int len, int w, int k, uint32_t rid, i
 int static mm_push_kmer(int w, int k, int t, kmer_info *kmer_vars) {
 	int buf_size = w + k - t;
     int k_buf_size = w;
-
 	// 1. calculate the minimal element's positon within the window
 	int window_pos = (*kmer_vars->min_pos - *kmer_vars->buf_pos + (buf_size - 1)) % buf_size;
 	// 2. mod-minimizer: modulo operation
