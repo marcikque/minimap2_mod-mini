@@ -57,4 +57,5 @@ For more details on the algorithm and its implementation, please refer to the [o
 ## Additional Information
 
 For all other details, usage instructions, and documentation, please refer to the original [minimap2 repository](https://github.com/lh3/minimap2).
+The version of the base Minimap2 program used for this modification and the corresponding benchmarks is `Release 2.28-r1209 (27 March 2024)`.
 
